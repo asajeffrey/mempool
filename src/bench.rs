@@ -4,6 +4,8 @@ extern crate test;
 
 use std::cell::RefCell;
 use std::sync::Mutex;
+use std::sync::atomic::{Ordering, AtomicUsize, AtomicPtr};
+use std::mem;
 
 use self::crossbeam::sync::{MsQueue, SegQueue, TreiberStack};
 use self::syncbox::ArrayQueue;
@@ -97,6 +99,18 @@ fn mutex_get_put(b: &mut Bencher) {
 #[bench]
 fn mpmc_get_put(b: &mut Bencher) {
     let pool = PoolMpmc::new(dummy());
+    let _ = pool.get();
+    b.iter(|| {
+        black_box({
+            let data = pool.get();
+            drop(data);
+        })
+    });
+}
+
+#[bench]
+fn lossy_mpmc_get_put(b: &mut Bencher) {
+    let pool = PoolLossyMpmc::new(dummy());
     let _ = pool.get();
     b.iter(|| {
         black_box({
@@ -248,6 +262,64 @@ impl<T: Send + 'static> PoolMpmc<T> {
 }
 
 impl<'a, T: Send + 'static> Drop for PoolMpmcGuard<'a, T> {
+    fn drop(&mut self) {
+        let data = self.data.take().unwrap();
+        self.pool.put(data);
+    }
+}
+
+struct PoolLossyMpmc<T: Send + 'static> {
+    pool: [Option<Box<T>>;16],
+    index: AtomicUsize,
+    create: CreateFn<Box<T>>,
+}
+
+struct PoolLossyMpmcGuard<'a, T: Send + 'static> {
+    pool: &'a PoolLossyMpmc<T>,
+    data: Option<Box<T>>,
+}
+
+impl<T: Send + 'static> PoolLossyMpmc<T> {
+    fn new(create: CreateFn<Box<T>>) -> PoolLossyMpmc<T> {
+        PoolLossyMpmc {
+            pool: unsafe { mem::zeroed() },
+            index: AtomicUsize::new(0),
+            create: create,
+        }
+    }
+
+    fn get(&self) -> PoolLossyMpmcGuard<T> {        
+        let index = self.index.load(Ordering::Relaxed);
+        let atomic: &AtomicUsize = unsafe { mem::transmute(self.pool[index..].as_ptr()) };
+        let boxed: Option<Box<T>> = unsafe { mem::transmute(atomic.swap(0, Ordering::Acquire)) };
+        let boxed = match boxed {
+            Some(boxed) => boxed,
+            None => (self.create)(),
+        };
+        if index > 0 { self.index.store(index - 1, Ordering::Relaxed); }
+        PoolLossyMpmcGuard{ pool: &self, data: Some(boxed) }
+    }
+
+    fn put(&self, mut data: Box<T>) {
+        let original = self.index.load(Ordering::Relaxed);
+        let mut index = original;
+        loop {
+            let atomic: &AtomicPtr<T> = unsafe { mem::transmute(self.pool[index..].as_ptr()) };
+            let boxed: Option<Box<T>> = unsafe { mem::transmute(atomic.swap(Box::into_raw(data), Ordering::Release)) };
+            data = match boxed {
+                Some(data) => data,
+                None => break,
+            };
+            index += 1;
+            if 15 <= index { break; }
+        }
+        if original != index {
+            self.index.store(index, Ordering::Relaxed);
+        }
+    }
+}
+
+impl<'a, T: Send + 'static> Drop for PoolLossyMpmcGuard<'a, T> {
     fn drop(&mut self) {
         let data = self.data.take().unwrap();
         self.pool.put(data);
